@@ -1,11 +1,12 @@
 """
 Codeforces Auto-Pusher: Automatically push accepted Codeforces solutions to GitHub.
 
-Uses the Codeforces API to fetch accepted submissions (with source code)
+Uses the Codeforces API to fetch accepted submissions
 and the GitHub API (PyGithub) to push them to a repository.
 """
 
 import hashlib
+import html as html_module
 import json
 import os
 import random
@@ -16,13 +17,14 @@ import time
 from typing import Dict, List, Optional, Set
 
 import requests
-from github import Github, GithubException, InputGitTreeElement
+from github import Auth, Github, GithubException, InputGitTreeElement
 
 # ── Configuration from environment variables ──────────────────────────────────
 
 CF_API_KEY = os.environ.get("CF_API_KEY", "")
 CF_API_SECRET = os.environ.get("CF_API_SECRET", "")
 CF_HANDLE = os.environ.get("CF_HANDLE", "")
+CF_PASSWORD = os.environ.get("CF_PASSWORD", "")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "")  # e.g. "MontassarBr/ProblemSolving"
 GITHUB_TARGET_DIR = os.environ.get("GITHUB_TARGET_DIR", "CodeForces")  # subfolder in the repo
@@ -176,7 +178,7 @@ def cf_api_request(method: str, params: Optional[Dict] = None) -> dict:
 
 
 def fetch_accepted_submissions() -> List[dict]:
-    """Fetch all accepted submissions for the configured handle, with source code."""
+    """Fetch all accepted submissions for the configured handle."""
     all_submissions = []
     page = 1
     page_size = 1000
@@ -187,7 +189,6 @@ def fetch_accepted_submissions() -> List[dict]:
             "handle": CF_HANDLE,
             "from": str(((page - 1) * page_size) + 1),
             "count": str(page_size),
-            "includeSources": "true",
         })
 
         if not result:
@@ -205,10 +206,6 @@ def fetch_accepted_submissions() -> List[dict]:
     accepted = [s for s in all_submissions if s.get("verdict") == "OK"]
     print(f"  Found {len(accepted)} accepted submissions out of {len(all_submissions)} total.")
 
-    # Check if source code is included
-    with_source = sum(1 for s in accepted if s.get("source"))
-    print(f"  Submissions with source code from API: {with_source}/{len(accepted)}")
-
     return accepted
 
 
@@ -223,49 +220,134 @@ def fetch_contest_names() -> Dict[int, str]:
     return mapping
 
 
+# ── Codeforces session (for scraping submission source code) ──────────────────
+
+
+def _compute_tta(csrf_token: str) -> int:
+    """Compute the _tta value from a CSRF token (CF's anti-bot measure)."""
+    tta = 0
+    for i, c in enumerate(csrf_token):
+        tta = (tta + (i + 1) * (ord(c) - 96)) % 1000000007
+    return tta
+
+
+def create_cf_session() -> requests.Session:
+    """
+    Create an authenticated Codeforces session.
+    Logs in with CF_HANDLE + CF_PASSWORD so we can scrape submission pages.
+    """
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        ),
+    })
+
+    if not CF_PASSWORD:
+        print("  Warning: CF_PASSWORD not set — scraping will likely fail (403)")
+        return session
+
+    print("  Logging in to Codeforces...")
+
+    # Step 1: GET the login page to obtain CSRF token and cookies
+    resp = session.get("https://codeforces.com/enter", timeout=30)
+    resp.raise_for_status()
+
+    # Step 2: Extract CSRF token from the HTML
+    csrf_match = re.search(
+        r'name=["\']csrf_token["\'][^>]*value=["\']([^"\'>]+)["\']', resp.text
+    )
+    if not csrf_match:
+        csrf_match = re.search(r'csrf_token["\']\s*value=["\']([^"\'>]+)', resp.text)
+    if not csrf_match:
+        raise RuntimeError("Could not extract CSRF token from Codeforces login page")
+
+    csrf_token = csrf_match.group(1)
+
+    # Step 3: POST login credentials
+    login_data = {
+        "csrf_token": csrf_token,
+        "action": "enter",
+        "ftaa": "",
+        "bfaa": "",
+        "handleOrEmail": CF_HANDLE,
+        "password": CF_PASSWORD,
+        "_tta": str(_compute_tta(csrf_token)),
+        "remember": "on",
+    }
+
+    resp = session.post(
+        "https://codeforces.com/enter",
+        data=login_data,
+        timeout=30,
+        allow_redirects=True,
+    )
+
+    # Step 4: Verify login succeeded
+    if CF_HANDLE.lower() in resp.text.lower() or "Logout" in resp.text:
+        print("  Successfully logged in to Codeforces")
+    else:
+        error_match = re.search(r'class="error[^"]*"[^>]*>(.*?)<', resp.text)
+        error_msg = error_match.group(1).strip() if error_match else "unknown reason"
+        raise RuntimeError(f"Codeforces login failed: {error_msg}")
+
+    return session
+
+
 # ── Source code fetching ──────────────────────────────────────────────────────
 
 
-def fetch_submission_source(contest_id: int, submission_id: int) -> Optional[str]:
+def fetch_submission_source(
+    session: requests.Session,
+    contest_id: int,
+    submission_id: int,
+) -> Optional[str]:
     """
-    Fetch source code for a single submission by scraping the submission page.
-    Used as a fallback when the API doesn't include source code.
+    Fetch source code for a submission by scraping its page.
+    Tries /contest/ URL first, then /gym/ as fallback.
     """
-    url = f"https://codeforces.com/contest/{contest_id}/submission/{submission_id}"
-    try:
-        resp = requests.get(url, timeout=30)
-        resp.raise_for_status()
-        html = resp.text
+    urls_to_try = [
+        f"https://codeforces.com/contest/{contest_id}/submission/{submission_id}",
+        f"https://codeforces.com/gym/{contest_id}/submission/{submission_id}",
+    ]
 
-        # Try multiple patterns — CF has changed their HTML over time
-        patterns = [
-            r'<pre\s+id="program-source-text"[^>]*>(.*?)</pre>',
-            r'<pre\s+class="program-source"[^>]*>(.*?)</pre>',
-            r'<pre\s+id="sourceCode"[^>]*>(.*?)</pre>',
-        ]
-        source = None
-        for pattern in patterns:
-            match = re.search(pattern, html, re.DOTALL)
-            if match:
-                source = match.group(1)
-                break
+    for url in urls_to_try:
+        try:
+            resp = session.get(url, timeout=30)
+            if resp.status_code == 404:
+                continue  # try next URL variant
+            resp.raise_for_status()
 
-        if source:
-            # Decode HTML entities
-            source = source.replace("&lt;", "<")
-            source = source.replace("&gt;", ">")
-            source = source.replace("&amp;", "&")
-            source = source.replace("&quot;", '"')
-            source = source.replace("&#39;", "'")
-            source = source.replace("&apos;", "'")
-            source = source.replace("&#x27;", "'")
-            source = source.replace("&nbsp;", " ")
-            source = source.replace("\r\n", "\n")
-            return source
-        else:
-            print(f"    Warning: Source code element not found in page HTML")
-    except Exception as e:
-        print(f"    Warning: Could not fetch source for submission {submission_id}: {e}")
+            # Try multiple HTML patterns — CF has changed markup over time
+            patterns = [
+                r'<pre\s+id="program-source-text"[^>]*>(.*?)</pre>',
+                r'<pre\s+class="program-source"[^>]*>(.*?)</pre>',
+                r'<pre\s+id="sourceCode"[^>]*>(.*?)</pre>',
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, resp.text, re.DOTALL)
+                if match:
+                    source = html_module.unescape(match.group(1))
+                    return source.replace("\r\n", "\n")
+
+            # Source tag not found in page
+            print(f"    Warning: Source element not found in HTML at {url}")
+            return None
+
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else "?"
+            if status == 403:
+                print(f"    Warning: 403 Forbidden for submission {submission_id}")
+                return None  # login likely failed; no point trying gym URL
+            # For other HTTP errors, try the next URL
+            continue
+        except Exception as e:
+            print(f"    Warning: Error fetching submission {submission_id}: {e}")
+            return None
+
+    print(f"    Warning: Submission {submission_id} not found at contest or gym URL")
     return None
 
 
@@ -380,7 +462,8 @@ def build_file_path(sub: dict, contest_names: Dict[int, str]) -> str:
 def validate_config():
     """Validate that all required environment variables are set."""
     missing = []
-    for var in ["CF_API_KEY", "CF_API_SECRET", "CF_HANDLE", "GITHUB_TOKEN", "GITHUB_REPO"]:
+    for var in ["CF_API_KEY", "CF_API_SECRET", "CF_HANDLE", "CF_PASSWORD",
+                "GITHUB_TOKEN", "GITHUB_REPO"]:
         if not os.environ.get(var):
             missing.append(var)
     if missing:
@@ -399,19 +482,23 @@ def main():
     print()
 
     # 1. Connect to GitHub
-    print("[1/6] Connecting to GitHub...")
-    gh = Github(GITHUB_TOKEN)
+    print("[1/7] Connecting to GitHub...")
+    gh = Github(auth=Auth.Token(GITHUB_TOKEN))
     repo = gh.get_repo(GITHUB_REPO)
     default_branch = repo.default_branch
     print(f"  Connected. Default branch: {default_branch}")
 
-    # 2. Load already-pushed state
-    print("[2/6] Loading pushed state...")
+    # 2. Log in to Codeforces (needed to scrape submission source code)
+    print("[2/7] Creating Codeforces session...")
+    cf_session = create_cf_session()
+
+    # 3. Load already-pushed state
+    print("[3/7] Loading pushed state...")
     pushed_ids = load_pushed_state(repo)
     print(f"  Already pushed: {len(pushed_ids)} submissions")
 
-    # 3. Fetch accepted submissions from Codeforces
-    print("[3/6] Fetching accepted submissions from Codeforces...")
+    # 4. Fetch accepted submissions from Codeforces
+    print("[4/7] Fetching accepted submissions from Codeforces...")
     accepted = fetch_accepted_submissions()
 
     if not accepted:
@@ -423,7 +510,7 @@ def main():
     unique = deduplicate_submissions(accepted)
     print(f"  Unique problems solved: {len(unique)}")
 
-    # 4. Filter out already-pushed
+    # Filter out already-pushed
     new_submissions = [s for s in unique if s["id"] not in pushed_ids]
     print(f"  New submissions to push: {len(new_submissions)}")
 
@@ -432,14 +519,14 @@ def main():
         return
 
     # 5. Fetch contest names for better folder naming
-    print("[4/6] Fetching contest names...")
+    print("[5/7] Fetching contest names...")
     contest_names = fetch_contest_names()
 
     # 6. Fetch source code and build file map
-    print(f"[5/6] Building file map for {len(new_submissions)} submissions...")
+    print(f"[6/7] Fetching source code for {len(new_submissions)} submissions...")
     file_map = {}  # path -> content
     newly_pushed = set()
-    scrape_count = 0
+    skipped = 0
 
     for i, sub in enumerate(new_submissions, 1):
         sub_id = sub["id"]
@@ -448,39 +535,30 @@ def main():
         index = problem.get("index", "?")
         name = problem.get("name", "?")
 
-        # Try to get source from the API response first
-        source = sub.get("source")
-
-        if not source:
-            # Fallback: scrape the submission page
-            scrape_count += 1
-            print(f"  [{i}/{len(new_submissions)}] Scraping source for {index}. {name} (submission {sub_id})...")
-            source = fetch_submission_source(contest_id, sub_id)
-            if i < len(new_submissions):
-                time.sleep(2)  # respect CF rate limit when scraping
-        else:
-            print(f"  [{i}/{len(new_submissions)}] {index}. {name} (source from API)")
+        print(f"  [{i}/{len(new_submissions)}] {index}. {name} (submission {sub_id})...")
+        source = fetch_submission_source(cf_session, contest_id, sub_id)
 
         if source is None:
             print(f"    Skipped (could not fetch source code)")
+            skipped += 1
             continue
 
         path = build_file_path(sub, contest_names)
         file_map[path] = source
         newly_pushed.add(sub_id)
 
-    if scrape_count > 0:
-        print(f"  Had to scrape {scrape_count} submissions (API didn't include source)")
+        if i < len(new_submissions):
+            time.sleep(2)  # respect CF rate limit
+
+    print(f"  Fetched: {len(file_map)}, Skipped: {skipped}")
 
     if not file_map:
         print("  ERROR: No source code could be fetched for any submission.")
-        print("  This usually means:")
-        print("    - The CF API key/secret don't match the CF_HANDLE account")
-        print("    - The API didn't return source code (includeSources requires your own account)")
+        print("  Check that CF_PASSWORD is correct and you can log in at codeforces.com/enter")
         sys.exit(1)
 
     # 7. Push to GitHub in batches
-    print(f"[6/6] Pushing {len(file_map)} files to GitHub...")
+    print(f"[7/7] Pushing {len(file_map)} files to GitHub...")
     all_paths = list(file_map.keys())
 
     for batch_start in range(0, len(all_paths), BATCH_SIZE):

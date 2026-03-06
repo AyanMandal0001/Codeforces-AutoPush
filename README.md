@@ -63,6 +63,7 @@ Go to **your fork of this repo** → **Settings** → **Secrets and variables** 
 | `CF_API_KEY`    | Your Codeforces API key                         |                                 |
 | `CF_API_SECRET` | Your Codeforces API secret                      |                                 |
 | `CF_HANDLE`     | Your Codeforces username                        | `tourist`                       |
+| `CF_PASSWORD`   | Your Codeforces password                        |                                 |
 | `GH_PAT`        | Your GitHub Personal Access Token               | `ghp_...`                       |
 | `TARGET_REPO`   | The repo where solutions should be pushed       | `username/ProblemSolving`       |
 | `TARGET_DIR`    | *(Optional)* Subfolder inside that repo         | `CodeForces`                    |
@@ -83,6 +84,7 @@ pip install -r requirements.txt
 $env:CF_API_KEY = "your_key"
 $env:CF_API_SECRET = "your_secret"
 $env:CF_HANDLE = "your_handle"
+$env:CF_PASSWORD = "your_password"
 $env:GITHUB_TOKEN = "ghp_your_token"
 $env:GITHUB_REPO = "username/repo"
 $env:GITHUB_TARGET_DIR = "CodeForces"   # optional
@@ -91,6 +93,7 @@ $env:GITHUB_TARGET_DIR = "CodeForces"   # optional
 export CF_API_KEY="your_key"
 export CF_API_SECRET="your_secret"
 export CF_HANDLE="your_handle"
+export CF_PASSWORD="your_password"
 export GITHUB_TOKEN="ghp_your_token"
 export GITHUB_REPO="username/repo"
 export GITHUB_TARGET_DIR="CodeForces"   # optional
@@ -104,7 +107,7 @@ python cf_autopush.py
 2. Filters for accepted solutions (`verdict == "OK"`)
 3. Keeps only the latest accepted submission per problem
 4. Checks `pushed.json` in the target repo to skip already-pushed solutions
-5. Scrapes source code from each Codeforces submission page
+5. Logs in to Codeforces and scrapes source code from each submission page
 6. Commits all new files in a single batch commit via the GitHub API
 7. Updates `pushed.json` with the newly pushed submission IDs
 
@@ -115,6 +118,7 @@ python cf_autopush.py
 | `CF_API_KEY`        | Yes      | Codeforces API key                             |
 | `CF_API_SECRET`     | Yes      | Codeforces API secret                          |
 | `CF_HANDLE`         | Yes      | Your Codeforces handle                         |
+| `CF_PASSWORD`       | Yes      | Your Codeforces password (for source access)   |
 | `GITHUB_TOKEN`      | Yes      | GitHub PAT with `repo` scope                   |
 | `GITHUB_REPO`       | Yes      | Target repo (e.g. `username/ProblemSolving`)   |
 | `GITHUB_TARGET_DIR` | No       | Subfolder in target repo (default: repo root)  |
