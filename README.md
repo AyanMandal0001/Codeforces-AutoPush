@@ -63,7 +63,7 @@ Go to **your fork of this repo** → **Settings** → **Secrets and variables** 
 | `CF_API_KEY`    | Your Codeforces API key                         |                                 |
 | `CF_API_SECRET` | Your Codeforces API secret                      |                                 |
 | `CF_HANDLE`     | Your Codeforces username                        | `tourist`                       |
-| `CF_PASSWORD`   | Your Codeforces password                        |                                 |
+| `CF_PASSWORD`   | *(Optional)* Your Codeforces password            |                                 |
 | `GH_PAT`        | Your GitHub Personal Access Token               | `ghp_...`                       |
 | `TARGET_REPO`   | The repo where solutions should be pushed       | `username/ProblemSolving`       |
 | `TARGET_DIR`    | *(Optional)* Subfolder inside that repo         | `CodeForces`                    |
@@ -118,7 +118,7 @@ python cf_autopush.py
 | `CF_API_KEY`        | Yes      | Codeforces API key                             |
 | `CF_API_SECRET`     | Yes      | Codeforces API secret                          |
 | `CF_HANDLE`         | Yes      | Your Codeforces handle                         |
-| `CF_PASSWORD`       | Yes      | Your Codeforces password (for source access)   |
+| `CF_PASSWORD`       | No       | CF password (for private submission access)    |
 | `GITHUB_TOKEN`      | Yes      | GitHub PAT with `repo` scope                   |
 | `GITHUB_REPO`       | Yes      | Target repo (e.g. `username/ProblemSolving`)   |
 | `GITHUB_TARGET_DIR` | No       | Subfolder in target repo (default: repo root)  |
