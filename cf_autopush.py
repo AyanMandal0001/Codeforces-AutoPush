@@ -187,6 +187,7 @@ def fetch_accepted_submissions() -> List[dict]:
             "handle": CF_HANDLE,
             "from": str(((page - 1) * page_size) + 1),
             "count": str(page_size),
+            "includeSources": "true",
         })
 
         if not result:
@@ -203,6 +204,11 @@ def fetch_accepted_submissions() -> List[dict]:
     # Filter for accepted (verdict == "OK")
     accepted = [s for s in all_submissions if s.get("verdict") == "OK"]
     print(f"  Found {len(accepted)} accepted submissions out of {len(all_submissions)} total.")
+
+    # Check if source code is included
+    with_source = sum(1 for s in accepted if s.get("source"))
+    print(f"  Submissions with source code from API: {with_source}/{len(accepted)}")
+
     return accepted
 
 
@@ -223,7 +229,7 @@ def fetch_contest_names() -> Dict[int, str]:
 def fetch_submission_source(contest_id: int, submission_id: int) -> Optional[str]:
     """
     Fetch source code for a single submission by scraping the submission page.
-    The CF API's user.status does not include source code, so we scrape it.
+    Used as a fallback when the API doesn't include source code.
     """
     url = f"https://codeforces.com/contest/{contest_id}/submission/{submission_id}"
     try:
@@ -231,11 +237,20 @@ def fetch_submission_source(contest_id: int, submission_id: int) -> Optional[str
         resp.raise_for_status()
         html = resp.text
 
-        # The source code is inside <pre id="program-source-text" ...>...</pre>
-        pattern = r'<pre\s+id="program-source-text"[^>]*>(.*?)</pre>'
-        match = re.search(pattern, html, re.DOTALL)
-        if match:
-            source = match.group(1)
+        # Try multiple patterns — CF has changed their HTML over time
+        patterns = [
+            r'<pre\s+id="program-source-text"[^>]*>(.*?)</pre>',
+            r'<pre\s+class="program-source"[^>]*>(.*?)</pre>',
+            r'<pre\s+id="sourceCode"[^>]*>(.*?)</pre>',
+        ]
+        source = None
+        for pattern in patterns:
+            match = re.search(pattern, html, re.DOTALL)
+            if match:
+                source = match.group(1)
+                break
+
+        if source:
             # Decode HTML entities
             source = source.replace("&lt;", "<")
             source = source.replace("&gt;", ">")
@@ -247,6 +262,8 @@ def fetch_submission_source(contest_id: int, submission_id: int) -> Optional[str
             source = source.replace("&nbsp;", " ")
             source = source.replace("\r\n", "\n")
             return source
+        else:
+            print(f"    Warning: Source code element not found in page HTML")
     except Exception as e:
         print(f"    Warning: Could not fetch source for submission {submission_id}: {e}")
     return None
@@ -399,6 +416,7 @@ def main():
 
     if not accepted:
         print("  No accepted submissions found. Exiting.")
+        print("  (Check that CF_HANDLE is correct and the API key belongs to this account)")
         return
 
     # Deduplicate: keep only the latest AC per problem
@@ -418,9 +436,10 @@ def main():
     contest_names = fetch_contest_names()
 
     # 6. Fetch source code and build file map
-    print(f"[5/6] Fetching source code for {len(new_submissions)} submissions...")
+    print(f"[5/6] Building file map for {len(new_submissions)} submissions...")
     file_map = {}  # path -> content
     newly_pushed = set()
+    scrape_count = 0
 
     for i, sub in enumerate(new_submissions, 1):
         sub_id = sub["id"]
@@ -429,9 +448,19 @@ def main():
         index = problem.get("index", "?")
         name = problem.get("name", "?")
 
-        print(f"  [{i}/{len(new_submissions)}] Fetching {index}. {name} (submission {sub_id})...")
+        # Try to get source from the API response first
+        source = sub.get("source")
 
-        source = fetch_submission_source(contest_id, sub_id)
+        if not source:
+            # Fallback: scrape the submission page
+            scrape_count += 1
+            print(f"  [{i}/{len(new_submissions)}] Scraping source for {index}. {name} (submission {sub_id})...")
+            source = fetch_submission_source(contest_id, sub_id)
+            if i < len(new_submissions):
+                time.sleep(2)  # respect CF rate limit when scraping
+        else:
+            print(f"  [{i}/{len(new_submissions)}] {index}. {name} (source from API)")
+
         if source is None:
             print(f"    Skipped (could not fetch source code)")
             continue
@@ -440,13 +469,15 @@ def main():
         file_map[path] = source
         newly_pushed.add(sub_id)
 
-        # Respect rate limiting on CF
-        if i < len(new_submissions):
-            time.sleep(2)
+    if scrape_count > 0:
+        print(f"  Had to scrape {scrape_count} submissions (API didn't include source)")
 
     if not file_map:
-        print("  No source code could be fetched. Exiting.")
-        return
+        print("  ERROR: No source code could be fetched for any submission.")
+        print("  This usually means:")
+        print("    - The CF API key/secret don't match the CF_HANDLE account")
+        print("    - The API didn't return source code (includeSources requires your own account)")
+        sys.exit(1)
 
     # 7. Push to GitHub in batches
     print(f"[6/6] Pushing {len(file_map)} files to GitHub...")
@@ -476,4 +507,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"\nFATAL ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
