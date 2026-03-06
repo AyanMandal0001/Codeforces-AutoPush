@@ -5,8 +5,8 @@ Uses the Codeforces API to fetch accepted submissions
 and the GitHub API (PyGithub) to push them to a repository.
 """
 
+import base64
 import hashlib
-import html as html_module
 import json
 import os
 import random
@@ -17,7 +17,6 @@ import time
 from typing import Dict, List, Optional, Set
 
 import requests
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from github import Auth, Github, GithubException, InputGitTreeElement
 
 # ── Configuration from environment variables ──────────────────────────────────
@@ -25,7 +24,6 @@ from github import Auth, Github, GithubException, InputGitTreeElement
 CF_API_KEY = os.environ.get("CF_API_KEY", "")
 CF_API_SECRET = os.environ.get("CF_API_SECRET", "")
 CF_HANDLE = os.environ.get("CF_HANDLE", "")
-CF_PASSWORD = os.environ.get("CF_PASSWORD", "")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "")  # e.g. "MontassarBr/ProblemSolving"
 GITHUB_TARGET_DIR = os.environ.get("GITHUB_TARGET_DIR", "CodeForces")  # subfolder in the repo
@@ -235,7 +233,7 @@ def fetch_accepted_submissions() -> List[dict]:
     print(f"  Found {len(accepted)} accepted submissions out of {len(all_submissions)} total.")
 
     # Check how many have source code from the API
-    with_source = sum(1 for s in accepted if s.get("source"))
+    with_source = sum(1 for s in accepted if s.get("sourceBase64"))
     print(f"  Submissions with source code from API: {with_source}/{len(accepted)}")
 
     return accepted
@@ -250,239 +248,6 @@ def fetch_contest_names() -> Dict[int, str]:
     for c in contests:
         mapping[c["id"]] = c.get("name", f"Contest_{c['id']}")
     return mapping
-
-
-# ── Codeforces session (for scraping submission source code) ──────────────────
-
-
-def _solve_rcpc(body: str) -> Optional[str]:
-    """
-    Solve the Codeforces RCPC anti-bot challenge.
-
-    CF returns a 403 with JavaScript that computes an AES-CBC decryption:
-      var a=toNumbers("key_hex"), b=toNumbers("iv_hex"), c=toNumbers("ct_hex");
-      document.cookie = "RCPC=" + toHex(slowAES.decrypt(c,2,a,b));
-
-    We extract a, b, c and compute the RCPC cookie value.
-    """
-    # Pattern 1: three toNumbers() calls (key, iv, ciphertext)
-    match = re.search(
-        r'toNumbers\("([0-9a-fA-F]+)"\)'
-        r'.*?toNumbers\("([0-9a-fA-F]+)"\)'
-        r'.*?toNumbers\("([0-9a-fA-F]+)"\)',
-        body,
-        re.DOTALL,
-    )
-    if match:
-        key = bytes.fromhex(match.group(1))
-        iv = bytes.fromhex(match.group(2))
-        ct = bytes.fromhex(match.group(3))
-        cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
-        decryptor = cipher.decryptor()
-        plaintext = decryptor.update(ct) + decryptor.finalize()
-        return plaintext.hex()
-
-    # Pattern 2: direct cookie value
-    match = re.search(r'document\.cookie\s*=\s*"RCPC=([0-9a-fA-F]+)', body)
-    if match:
-        return match.group(1)
-
-    return None
-
-
-def create_cf_session() -> requests.Session:
-    """
-    Create a Codeforces session that can access submission pages.
-    Solves the RCPC anti-bot challenge and optionally logs in.
-    """
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36"
-        ),
-    })
-
-    # Step 1: Visit CF homepage to get initial cookies and solve RCPC if needed
-    print("  Warming up session...")
-    resp = session.get("https://codeforces.com", timeout=30)
-
-    if resp.status_code == 403:
-        rcpc_value = _solve_rcpc(resp.text)
-        if rcpc_value:
-            session.cookies.set("RCPC", rcpc_value, domain=".codeforces.com", path="/")
-            print(f"  Solved RCPC challenge")
-            # Retry homepage with the cookie
-            resp = session.get("https://codeforces.com", timeout=30)
-            if resp.status_code == 200:
-                print("  Session warmed up successfully")
-            else:
-                print(f"  Warning: Homepage returned {resp.status_code} after RCPC solve")
-        else:
-            print("  Warning: Got 403 but could not solve RCPC challenge")
-            print(f"  Response preview: {resp.text[:500]}")
-    else:
-        print("  Session warmed up (no RCPC challenge)")
-
-    # Step 2: Optionally log in for extra reliability
-    if CF_PASSWORD:
-        print("  Logging in to Codeforces...")
-        try:
-            login_resp = session.get("https://codeforces.com/enter", timeout=30)
-
-            # Handle RCPC on login page too
-            if login_resp.status_code == 403:
-                rcpc_value = _solve_rcpc(login_resp.text)
-                if rcpc_value:
-                    session.cookies.set("RCPC", rcpc_value, domain=".codeforces.com", path="/")
-                    login_resp = session.get("https://codeforces.com/enter", timeout=30)
-
-            csrf_match = re.search(
-                r'name=["\']csrf_token["\'][^>]*value=["\']([^"\'>]+)["\']',
-                login_resp.text,
-            )
-            if not csrf_match:
-                csrf_match = re.search(
-                    r'csrf_token["\']\s*value=["\']([^"\'>]+)', login_resp.text
-                )
-
-            if csrf_match:
-                csrf_token = csrf_match.group(1)
-                tta = 0
-                for i, c in enumerate(csrf_token):
-                    tta = (tta + (i + 1) * (ord(c) - 96)) % 1000000007
-
-                login_data = {
-                    "csrf_token": csrf_token,
-                    "action": "enter",
-                    "ftaa": "",
-                    "bfaa": "",
-                    "handleOrEmail": CF_HANDLE,
-                    "password": CF_PASSWORD,
-                    "_tta": str(tta),
-                    "remember": "on",
-                }
-                resp = session.post(
-                    "https://codeforces.com/enter",
-                    data=login_data,
-                    timeout=30,
-                    allow_redirects=True,
-                )
-                if CF_HANDLE.lower() in resp.text.lower() or "Logout" in resp.text:
-                    print("  Logged in successfully")
-                else:
-                    print("  Warning: Login may have failed (continuing anyway)")
-            else:
-                print("  Warning: Could not find CSRF token (continuing without login)")
-        except Exception as e:
-            print(f"  Warning: Login failed: {e} (continuing without login)")
-
-    return session
-
-
-# ── Source code fetching ──────────────────────────────────────────────────────
-
-
-def _get_with_rcpc_retry(
-    session: requests.Session, url: str, max_retries: int = 3
-) -> Optional[requests.Response]:
-    """
-    GET a URL, solving RCPC challenges and retrying on 403.
-    Returns the response on success, or None if all retries fail.
-    """
-    for attempt in range(max_retries):
-        resp = session.get(url, timeout=30)
-
-        if resp.status_code == 200:
-            return resp
-
-        if resp.status_code == 404:
-            return None  # page doesn't exist, no point retrying
-
-        if resp.status_code == 403:
-            # Try to solve RCPC challenge from the response
-            rcpc_value = _solve_rcpc(resp.text)
-            if rcpc_value:
-                session.cookies.set("RCPC", rcpc_value, domain=".codeforces.com", path="/")
-                if attempt == 0:
-                    print(f"    Solved RCPC, retrying...")
-                continue
-
-            # No RCPC in the 403 — wait and retry (might be rate limiting)
-            if attempt < max_retries - 1:
-                delay = 3 * (attempt + 1)
-                print(f"    Got 403, waiting {delay}s before retry...")
-                time.sleep(delay)
-                continue
-
-            # All retries exhausted
-            return resp
-
-        # Other status codes — return as-is
-        return resp
-
-    return None
-
-
-def fetch_submission_source(
-    session: requests.Session,
-    contest_id: int,
-    submission_id: int,
-) -> Optional[str]:
-    """
-    Fetch source code for a submission by scraping its page.
-    Tries /contest/ URL first, then /gym/ as fallback.
-    """
-    urls_to_try = [
-        f"https://codeforces.com/contest/{contest_id}/submission/{submission_id}",
-        f"https://codeforces.com/gym/{contest_id}/submission/{submission_id}",
-    ]
-
-    for url in urls_to_try:
-        resp = _get_with_rcpc_retry(session, url)
-
-        if resp is None:
-            continue  # 404 or total failure, try next URL
-
-        if resp.status_code != 200:
-            if resp.status_code == 403:
-                print(f"    Warning: 403 after retries for submission {submission_id}")
-                return None
-            continue
-
-        # Parse source code from HTML (same approach as reference script)
-        content = resp.text
-        start_marker = '<pre id="program-source-text"'
-        start_idx = content.find(start_marker)
-
-        if start_idx == -1:
-            # Try regex patterns as fallback
-            patterns = [
-                r'<pre\s+class="program-source"[^>]*>(.*?)</pre>',
-                r'<pre\s+id="sourceCode"[^>]*>(.*?)</pre>',
-            ]
-            for pattern in patterns:
-                match = re.search(pattern, content, re.DOTALL)
-                if match:
-                    source = html_module.unescape(match.group(1))
-                    return source.replace("\r\n", "\n")
-
-            print(f"    Warning: Source element not found in HTML")
-            return None
-
-        # Found the marker — extract code using string parsing
-        code_start = content.find(">", start_idx) + 1
-        code_end = content.find("</pre>", code_start)
-        if code_end > code_start:
-            source = html_module.unescape(content[code_start:code_end])
-            return source.replace("\r\n", "\n")
-
-        print(f"    Warning: Could not extract code from HTML")
-        return None
-
-    print(f"    Warning: Submission {submission_id} not found at contest or gym URL")
-    return None
 
 
 # ── GitHub operations ─────────────────────────────────────────────────────────
@@ -657,52 +422,34 @@ def main():
     print("[5/7] Fetching contest names...")
     contest_names = fetch_contest_names()
 
-    # 6. Build file map — use source from API, fall back to scraping
+    # 6. Build file map from API source code
     print(f"[6/7] Building file map for {len(new_submissions)} submissions...")
     file_map = {}  # path -> content
     newly_pushed = set()
-    missing_source = []  # submissions without source from API
+    skipped = 0
 
     for sub in new_submissions:
-        source = sub.get("source")
+        b64 = sub.get("sourceBase64", "")
+        if b64:
+            try:
+                source = base64.b64decode(b64).decode("utf-8", errors="replace")
+            except Exception:
+                source = None
+        else:
+            source = None
+
         if source:
             path = build_file_path(sub, contest_names)
             file_map[path] = source
             newly_pushed.add(sub["id"])
         else:
-            missing_source.append(sub)
-
-    print(f"  From API: {len(file_map)} submissions with source code")
-
-    # Fallback: scrape source code for submissions not returned by API
-    if missing_source:
-        print(f"  Scraping {len(missing_source)} submissions without API source...")
-        cf_session = create_cf_session()
-        skipped = 0
-
-        for i, sub in enumerate(missing_source, 1):
-            sub_id = sub["id"]
-            contest_id = sub.get("contestId") or sub.get("problem", {}).get("contestId")
             problem = sub.get("problem", {})
             index = problem.get("index", "?")
             name = problem.get("name", "?")
+            print(f"    Skipped {index}. {name} (no source in API response)")
+            skipped += 1
 
-            print(f"    [{i}/{len(missing_source)}] {index}. {name} (submission {sub_id})...")
-            source = fetch_submission_source(cf_session, contest_id, sub_id)
-
-            if source is None:
-                print(f"      Skipped (could not fetch source code)")
-                skipped += 1
-                continue
-
-            path = build_file_path(sub, contest_names)
-            file_map[path] = source
-            newly_pushed.add(sub_id)
-
-            if i < len(missing_source):
-                time.sleep(2)  # respect CF rate limit
-
-        print(f"  Scraped: {len(file_map) - (len(new_submissions) - len(missing_source))}, Skipped: {skipped}")
+    print(f"  Built: {len(file_map)} files, Skipped: {skipped}")
 
     if not file_map:
         print("  ERROR: No source code could be fetched.")
