@@ -169,6 +169,16 @@ def cf_api_request(method: str, params: Optional[Dict] = None) -> dict:
 
     url = f"{CF_API_BASE}/{method}"
     resp = requests.get(url, params=params, timeout=30)
+
+    # Debug: check for auth errors before raise_for_status
+    if resp.status_code != 200:
+        print(f"    API call {method} returned status {resp.status_code}")
+        try:
+            err_data = resp.json()
+            print(f"    Response: {err_data}")
+        except Exception:
+            print(f"    Response text: {resp.text[:300]}")
+
     resp.raise_for_status()
     data = resp.json()
 
@@ -176,6 +186,22 @@ def cf_api_request(method: str, params: Optional[Dict] = None) -> dict:
         raise RuntimeError(f"Codeforces API error: {data.get('comment', 'Unknown error')}")
 
     return data["result"]
+
+
+def verify_api_auth():
+    """Verify that the API key is working by calling user.friends (requires auth)."""
+    print("  Verifying API authentication...")
+    try:
+        cf_api_request("user.friends", {"onlyOnline": "false"})
+        print("  API key is valid and authenticated!")
+        return True
+    except Exception as e:
+        print(f"  ERROR: API authentication failed: {e}")
+        print(f"  API Key (first 8 chars): {CF_API_KEY[:8]}...")
+        print(f"  API Secret set: {'yes' if CF_API_SECRET else 'NO - EMPTY!'}")
+        print("  Make sure CF_API_KEY and CF_API_SECRET secrets are set correctly.")
+        print("  Generate them at: https://codeforces.com/settings/api")
+        return False
 
 
 def fetch_accepted_submissions() -> List[dict]:
@@ -596,13 +622,18 @@ def main():
     default_branch = repo.default_branch
     print(f"  Connected. Default branch: {default_branch}")
 
-    # 2. Load already-pushed state
-    print("[2/6] Loading pushed state...")
+    # 2. Verify API authentication
+    print("[2/6] Verifying Codeforces API auth...")
+    if not verify_api_auth():
+        sys.exit(1)
+
+    # 3. Load already-pushed state
+    print("[3/7] Loading pushed state...")
     pushed_ids = load_pushed_state(repo)
     print(f"  Already pushed: {len(pushed_ids)} submissions")
 
-    # 3. Fetch accepted submissions from Codeforces (with source code via API)
-    print("[3/6] Fetching accepted submissions from Codeforces...")
+    # 4. Fetch accepted submissions from Codeforces (with source code via API)
+    print("[4/7] Fetching accepted submissions from Codeforces...")
     accepted = fetch_accepted_submissions()
 
     if not accepted:
@@ -622,12 +653,12 @@ def main():
         print("  Everything is up to date. Nothing to push.")
         return
 
-    # 4. Fetch contest names for better folder naming
-    print("[4/6] Fetching contest names...")
+    # 5. Fetch contest names for better folder naming
+    print("[5/7] Fetching contest names...")
     contest_names = fetch_contest_names()
 
-    # 5. Build file map — use source from API, fall back to scraping
-    print(f"[5/6] Building file map for {len(new_submissions)} submissions...")
+    # 6. Build file map — use source from API, fall back to scraping
+    print(f"[6/7] Building file map for {len(new_submissions)} submissions...")
     file_map = {}  # path -> content
     newly_pushed = set()
     missing_source = []  # submissions without source from API
@@ -679,8 +710,8 @@ def main():
         print("  (includeSources only works for your own account)")
         sys.exit(1)
 
-    # 6. Push to GitHub in batches
-    print(f"[6/6] Pushing {len(file_map)} files to GitHub...")
+    # 7. Push to GitHub in batches
+    print(f"[7/7] Pushing {len(file_map)} files to GitHub...")
     all_paths = list(file_map.keys())
 
     for batch_start in range(0, len(all_paths), BATCH_SIZE):
