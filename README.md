@@ -45,6 +45,8 @@ git push
 2. Click **"Add API key"**
 3. Copy the **Key** and **Secret**
 
+> **Important**: The API key must be generated from the **same Codeforces account** as your `CF_HANDLE`. The `includeSources` API feature only returns source code for your own submissions.
+
 ### 3. Create a GitHub Personal Access Token (PAT)
 
 The tool pushes solutions to a target repo via the GitHub API, so it needs a PAT:
@@ -66,9 +68,6 @@ Go to **your fork of this repo** → **Settings** → **Secrets and variables** 
 | `GH_PAT`        | Your GitHub Personal Access Token               | `ghp_...`                       |
 | `TARGET_REPO`   | The repo where solutions should be pushed       | `username/ProblemSolving`       |
 | `TARGET_DIR`    | *(Optional)* Subfolder inside that repo         | `CodeForces`                    |
-| `CF_PASSWORD`   | *(Optional)* Your Codeforces password           |                                 |
-
-> `CF_PASSWORD` is optional. The script solves CF's anti-bot challenge (RCPC) automatically. Only add your password if scraping still fails without it.
 
 > If `TARGET_DIR` is left empty, solutions are pushed to the root of the target repo.
 
@@ -89,7 +88,6 @@ $env:CF_HANDLE = "your_handle"
 $env:GITHUB_TOKEN = "ghp_your_token"
 $env:GITHUB_REPO = "username/repo"
 $env:GITHUB_TARGET_DIR = "CodeForces"   # optional
-# $env:CF_PASSWORD = "your_password"   # optional
 
 # On Linux/Mac:
 export CF_API_KEY="your_key"
@@ -98,18 +96,17 @@ export CF_HANDLE="your_handle"
 export GITHUB_TOKEN="ghp_your_token"
 export GITHUB_REPO="username/repo"
 export GITHUB_TARGET_DIR="CodeForces"   # optional
-# export CF_PASSWORD="your_password"   # optional
 
 python cf_autopush.py
 ```
 
 ## How It Works
 
-1. Calls the Codeforces API (`user.status`) to fetch all your submissions
-2. Filters for accepted solutions (`verdict == "OK"`)
-3. Keeps only the latest accepted submission per problem
-4. Checks `pushed.json` in the target repo to skip already-pushed solutions
-5. Solves CF's RCPC anti-bot challenge, then scrapes source code from each submission page
+1. Verifies API authentication with Codeforces
+2. Calls the Codeforces API (`user.status` with `includeSources`) to fetch all your submissions with source code
+3. Filters for accepted solutions (`verdict == "OK"`)
+4. Keeps only the latest accepted submission per problem
+5. Checks `pushed.json` in the target repo to skip already-pushed solutions
 6. Commits all new files in a single batch commit via the GitHub API
 7. Updates `pushed.json` with the newly pushed submission IDs
 
@@ -123,7 +120,6 @@ python cf_autopush.py
 | `GITHUB_TOKEN`      | Yes      | GitHub PAT with `repo` scope                   |
 | `GITHUB_REPO`       | Yes      | Target repo (e.g. `username/ProblemSolving`)   |
 | `GITHUB_TARGET_DIR` | No       | Subfolder in target repo (default: repo root)  |
-| `CF_PASSWORD`       | No       | CF password (fallback if RCPC solving fails)   |
 
 ## FAQ
 
