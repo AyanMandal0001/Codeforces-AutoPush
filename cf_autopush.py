@@ -17,6 +17,7 @@ import time
 from typing import Dict, List, Optional, Set
 
 import requests
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from github import Auth, Github, GithubException, InputGitTreeElement
 
 # ── Configuration from environment variables ──────────────────────────────────
@@ -220,125 +221,48 @@ def fetch_contest_names() -> Dict[int, str]:
     return mapping
 
 
-# ── Codeforces web session (for scraping submission source code) ──────────────
+# ── Codeforces session (for scraping submission source code) ──────────────────
 
 
-def _solve_rcpc_challenge(session: requests.Session, resp: requests.Response) -> bool:
+def _solve_rcpc(body: str) -> Optional[str]:
     """
-    Solve CF's RCPC anti-bot challenge.
+    Solve the Codeforces RCPC anti-bot challenge.
 
-    CF serves a page with JavaScript that computes a cookie value
-    (via AES-CBC decryption or BigInt multiplication) and sets it
-    before allowing access. We replicate that computation in Python.
-    Returns True if a challenge was found and solved.
+    CF returns a 403 with JavaScript that computes an AES-CBC decryption:
+      var a=toNumbers("key_hex"), b=toNumbers("iv_hex"), c=toNumbers("ct_hex");
+      document.cookie = "RCPC=" + toHex(slowAES.decrypt(c,2,a,b));
+
+    We extract a, b, c and compute the RCPC cookie value.
     """
-    text = resp.text
-
-    # Pattern 1 (current): AES-CBC decryption
-    # a=toNumbers("...");b=toNumbers("...");c=toNumbers("...");
-    a_match = re.search(r'a=toNumbers\("([0-9a-fA-F]+)"\)', text)
-    b_match = re.search(r'b=toNumbers\("([0-9a-fA-F]+)"\)', text)
-    c_match = re.search(r'c=toNumbers\("([0-9a-fA-F]+)"\)', text)
-
-    if a_match and b_match and c_match:
-        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-
-        key = bytes.fromhex(a_match.group(1))
-        iv = bytes.fromhex(b_match.group(1))
-        ciphertext = bytes.fromhex(c_match.group(1))
-
+    # Pattern 1: three toNumbers() calls (key, iv, ciphertext)
+    match = re.search(
+        r'toNumbers\("([0-9a-fA-F]+)"\)'
+        r'.*?toNumbers\("([0-9a-fA-F]+)"\)'
+        r'.*?toNumbers\("([0-9a-fA-F]+)"\)',
+        body,
+        re.DOTALL,
+    )
+    if match:
+        key = bytes.fromhex(match.group(1))
+        iv = bytes.fromhex(match.group(2))
+        ct = bytes.fromhex(match.group(3))
         cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
         decryptor = cipher.decryptor()
-        plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+        plaintext = decryptor.update(ct) + decryptor.finalize()
+        return plaintext.hex()
 
-        session.cookies.set("RCPC", plaintext.hex(), domain=".codeforces.com", path="/")
-        print("    Solved RCPC challenge (AES)")
-        return True
+    # Pattern 2: direct cookie value
+    match = re.search(r'document\.cookie\s*=\s*"RCPC=([0-9a-fA-F]+)', body)
+    if match:
+        return match.group(1)
 
-    # Pattern 2: all hex values from toNumbers calls (flexible variable names)
-    all_hex = re.findall(r'toNumbers\("([0-9a-fA-F]+)"\)', text)
-    if len(all_hex) >= 3:
-        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-
-        key = bytes.fromhex(all_hex[0])
-        iv = bytes.fromhex(all_hex[1])
-        ciphertext = bytes.fromhex(all_hex[2])
-
-        cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
-        decryptor = cipher.decryptor()
-        plaintext = decryptor.update(ciphertext) + decryptor.finalize()
-
-        session.cookies.set("RCPC", plaintext.hex(), domain=".codeforces.com", path="/")
-        print("    Solved RCPC challenge (AES, flexible)")
-        return True
-
-    # Pattern 3: BigInt multiplication
-    big_match = re.search(
-        r'var\s+\w+\s*=\s*BigInt\(["\']0x([0-9a-fA-F]+)["\']\).*?'
-        r'var\s+\w+\s*=\s*BigInt\(["\']0x([0-9a-fA-F]+)["\']\)',
-        text, re.DOTALL,
-    )
-    if big_match:
-        a_val = int(big_match.group(1), 16)
-        b_val = int(big_match.group(2), 16)
-        session.cookies.set("RCPC", hex(a_val * b_val)[2:],
-                            domain=".codeforces.com", path="/")
-        print("    Solved RCPC challenge (BigInt)")
-        return True
-
-    # Pattern 4: direct cookie assignment in JS
-    cookie_match = re.search(
-        r"document\.cookie\s*=\s*['\"]RCPC=([0-9a-fA-F]+)", text
-    )
-    if cookie_match:
-        session.cookies.set("RCPC", cookie_match.group(1),
-                            domain=".codeforces.com", path="/")
-        print("    Solved RCPC challenge (direct cookie)")
-        return True
-
-    return False
-
-
-def _cf_get(
-    session: requests.Session,
-    url: str,
-    max_retries: int = 3,
-) -> requests.Response:
-    """
-    GET a Codeforces URL, automatically solving the RCPC challenge if needed.
-    Retries with backoff if blocked.
-    """
-    for attempt in range(1, max_retries + 1):
-        resp = session.get(url, timeout=30)
-
-        if resp.status_code != 403:
-            resp.raise_for_status()
-            return resp
-
-        # 403 — try to solve RCPC challenge
-        if _solve_rcpc_challenge(session, resp):
-            # Retry with the new cookie
-            resp = session.get(url, timeout=30)
-            if resp.status_code != 403:
-                resp.raise_for_status()
-                return resp
-
-        if attempt < max_retries:
-            delay = 5 * attempt
-            print(f"    Retry {attempt}/{max_retries} in {delay}s...")
-            time.sleep(delay)
-
-    # All retries exhausted — print debug info and raise
-    body_preview = resp.text[:500].replace("\n", " ").replace("\r", "")
-    print(f"  [Debug] 403 response ({len(resp.text)} chars): {body_preview}")
-    resp.raise_for_status()
-    return resp  # unreachable, raise_for_status throws
+    return None
 
 
 def create_cf_session() -> requests.Session:
     """
-    Create a Codeforces web session with the RCPC challenge solved.
-    Optionally logs in if CF_PASSWORD is provided.
+    Create a Codeforces session that can access submission pages.
+    Solves the RCPC anti-bot challenge and optionally logs in.
     """
     session = requests.Session()
     session.headers.update({
@@ -347,76 +271,127 @@ def create_cf_session() -> requests.Session:
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/131.0.0.0 Safari/537.36"
         ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
     })
 
-    # Step 1: Warm up session by hitting the main page (solves RCPC if needed)
-    print("  Warming up session on codeforces.com...")
-    try:
-        resp = _cf_get(session, "https://codeforces.com/")
-        print("  Session ready (RCPC passed)")
-    except requests.HTTPError:
-        print("  Warning: Could not access codeforces.com — will retry per-submission")
-        return session
+    # Step 1: Visit CF homepage to get initial cookies and solve RCPC if needed
+    print("  Warming up session...")
+    resp = session.get("https://codeforces.com", timeout=30)
 
-    # Step 2: Optionally log in (only if CF_PASSWORD is set)
+    if resp.status_code == 403:
+        rcpc_value = _solve_rcpc(resp.text)
+        if rcpc_value:
+            session.cookies.set("RCPC", rcpc_value, domain=".codeforces.com", path="/")
+            print(f"  Solved RCPC challenge")
+            # Retry homepage with the cookie
+            resp = session.get("https://codeforces.com", timeout=30)
+            if resp.status_code == 200:
+                print("  Session warmed up successfully")
+            else:
+                print(f"  Warning: Homepage returned {resp.status_code} after RCPC solve")
+        else:
+            print("  Warning: Got 403 but could not solve RCPC challenge")
+            print(f"  Response preview: {resp.text[:500]}")
+    else:
+        print("  Session warmed up (no RCPC challenge)")
+
+    # Step 2: Optionally log in for extra reliability
     if CF_PASSWORD:
         print("  Logging in to Codeforces...")
         try:
-            resp = _cf_get(session, "https://codeforces.com/enter")
-        except requests.HTTPError:
-            print("  Warning: Could not access login page — proceeding without login")
-            return session
+            login_resp = session.get("https://codeforces.com/enter", timeout=30)
 
-        # Extract CSRF token
-        csrf_match = re.search(
-            r'name=["\']csrf_token["\'][^>]*value=["\']([^"\'>]+)["\']', resp.text
-        )
-        if not csrf_match:
+            # Handle RCPC on login page too
+            if login_resp.status_code == 403:
+                rcpc_value = _solve_rcpc(login_resp.text)
+                if rcpc_value:
+                    session.cookies.set("RCPC", rcpc_value, domain=".codeforces.com", path="/")
+                    login_resp = session.get("https://codeforces.com/enter", timeout=30)
+
             csrf_match = re.search(
-                r'csrf_token["\']\s*value=["\']([^"\'>]+)', resp.text
+                r'name=["\']csrf_token["\'][^>]*value=["\']([^"\'>]+)["\']',
+                login_resp.text,
             )
-        if not csrf_match:
-            print("  Warning: Could not find CSRF token — proceeding without login")
-            return session
+            if not csrf_match:
+                csrf_match = re.search(
+                    r'csrf_token["\']\s*value=["\']([^"\'>]+)', login_resp.text
+                )
 
-        csrf_token = csrf_match.group(1)
+            if csrf_match:
+                csrf_token = csrf_match.group(1)
+                tta = 0
+                for i, c in enumerate(csrf_token):
+                    tta = (tta + (i + 1) * (ord(c) - 96)) % 1000000007
 
-        # Compute _tta
-        tta = 0
-        for i, c in enumerate(csrf_token):
-            tta = (tta + (i + 1) * (ord(c) - 96)) % 1000000007
-
-        login_data = {
-            "csrf_token": csrf_token,
-            "action": "enter",
-            "ftaa": "",
-            "bfaa": "",
-            "handleOrEmail": CF_HANDLE,
-            "password": CF_PASSWORD,
-            "_tta": str(tta),
-            "remember": "on",
-        }
-
-        resp = session.post(
-            "https://codeforces.com/enter",
-            data=login_data,
-            timeout=30,
-            allow_redirects=True,
-        )
-
-        if CF_HANDLE.lower() in resp.text.lower() or "Logout" in resp.text:
-            print("  Successfully logged in to Codeforces")
-        else:
-            print("  Warning: Login may have failed — proceeding anyway")
-    else:
-        print("  No CF_PASSWORD set — accessing public submissions only")
+                login_data = {
+                    "csrf_token": csrf_token,
+                    "action": "enter",
+                    "ftaa": "",
+                    "bfaa": "",
+                    "handleOrEmail": CF_HANDLE,
+                    "password": CF_PASSWORD,
+                    "_tta": str(tta),
+                    "remember": "on",
+                }
+                resp = session.post(
+                    "https://codeforces.com/enter",
+                    data=login_data,
+                    timeout=30,
+                    allow_redirects=True,
+                )
+                if CF_HANDLE.lower() in resp.text.lower() or "Logout" in resp.text:
+                    print("  Logged in successfully")
+                else:
+                    print("  Warning: Login may have failed (continuing anyway)")
+            else:
+                print("  Warning: Could not find CSRF token (continuing without login)")
+        except Exception as e:
+            print(f"  Warning: Login failed: {e} (continuing without login)")
 
     return session
 
 
 # ── Source code fetching ──────────────────────────────────────────────────────
+
+
+def _get_with_rcpc_retry(
+    session: requests.Session, url: str, max_retries: int = 3
+) -> Optional[requests.Response]:
+    """
+    GET a URL, solving RCPC challenges and retrying on 403.
+    Returns the response on success, or None if all retries fail.
+    """
+    for attempt in range(max_retries):
+        resp = session.get(url, timeout=30)
+
+        if resp.status_code == 200:
+            return resp
+
+        if resp.status_code == 404:
+            return None  # page doesn't exist, no point retrying
+
+        if resp.status_code == 403:
+            # Try to solve RCPC challenge from the response
+            rcpc_value = _solve_rcpc(resp.text)
+            if rcpc_value:
+                session.cookies.set("RCPC", rcpc_value, domain=".codeforces.com", path="/")
+                if attempt == 0:
+                    print(f"    Solved RCPC, retrying...")
+                continue
+
+            # No RCPC in the 403 — wait and retry (might be rate limiting)
+            if attempt < max_retries - 1:
+                delay = 3 * (attempt + 1)
+                print(f"    Got 403, waiting {delay}s before retry...")
+                time.sleep(delay)
+                continue
+
+            # All retries exhausted
+            return resp
+
+        # Other status codes — return as-is
+        return resp
+
+    return None
 
 
 def fetch_submission_source(
@@ -434,44 +409,46 @@ def fetch_submission_source(
     ]
 
     for url in urls_to_try:
-        try:
-            resp = session.get(url, timeout=30)
-            # Handle RCPC on submission pages too
-            if resp.status_code == 403:
-                if _solve_rcpc_challenge(session, resp):
-                    resp = session.get(url, timeout=30)
-                else:
-                    print(f"    Warning: 403 Forbidden for submission {submission_id}")
-                    return None
-            if resp.status_code == 404:
-                continue  # try next URL variant
-            resp.raise_for_status()
+        resp = _get_with_rcpc_retry(session, url)
 
-            # Try multiple HTML patterns — CF has changed markup over time
+        if resp is None:
+            continue  # 404 or total failure, try next URL
+
+        if resp.status_code != 200:
+            if resp.status_code == 403:
+                print(f"    Warning: 403 after retries for submission {submission_id}")
+                return None
+            continue
+
+        # Parse source code from HTML (same approach as reference script)
+        content = resp.text
+        start_marker = '<pre id="program-source-text"'
+        start_idx = content.find(start_marker)
+
+        if start_idx == -1:
+            # Try regex patterns as fallback
             patterns = [
-                r'<pre\s+id="program-source-text"[^>]*>(.*?)</pre>',
                 r'<pre\s+class="program-source"[^>]*>(.*?)</pre>',
                 r'<pre\s+id="sourceCode"[^>]*>(.*?)</pre>',
             ]
             for pattern in patterns:
-                match = re.search(pattern, resp.text, re.DOTALL)
+                match = re.search(pattern, content, re.DOTALL)
                 if match:
                     source = html_module.unescape(match.group(1))
                     return source.replace("\r\n", "\n")
 
-            # Source tag not found in page
-            print(f"    Warning: Source element not found in page")
+            print(f"    Warning: Source element not found in HTML")
             return None
 
-        except requests.HTTPError as e:
-            status = e.response.status_code if e.response is not None else "?"
-            if status == 403:
-                print(f"    Warning: 403 Forbidden for submission {submission_id}")
-                return None
-            continue
-        except Exception as e:
-            print(f"    Warning: Error fetching submission {submission_id}: {e}")
-            return None
+        # Found the marker — extract code using string parsing
+        code_start = content.find(">", start_idx) + 1
+        code_end = content.find("</pre>", code_start)
+        if code_end > code_start:
+            source = html_module.unescape(content[code_start:code_end])
+            return source.replace("\r\n", "\n")
+
+        print(f"    Warning: Could not extract code from HTML")
+        return None
 
     print(f"    Warning: Submission {submission_id} not found at contest or gym URL")
     return None
