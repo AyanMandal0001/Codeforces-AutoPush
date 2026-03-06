@@ -179,7 +179,7 @@ def cf_api_request(method: str, params: Optional[Dict] = None) -> dict:
 
 
 def fetch_accepted_submissions() -> List[dict]:
-    """Fetch all accepted submissions for the configured handle."""
+    """Fetch all accepted submissions for the configured handle, with source code."""
     all_submissions = []
     page = 1
     page_size = 1000
@@ -190,6 +190,7 @@ def fetch_accepted_submissions() -> List[dict]:
             "handle": CF_HANDLE,
             "from": str(((page - 1) * page_size) + 1),
             "count": str(page_size),
+            "includeSources": "true",
         })
 
         if not result:
@@ -206,6 +207,10 @@ def fetch_accepted_submissions() -> List[dict]:
     # Filter for accepted (verdict == "OK")
     accepted = [s for s in all_submissions if s.get("verdict") == "OK"]
     print(f"  Found {len(accepted)} accepted submissions out of {len(all_submissions)} total.")
+
+    # Check how many have source code from the API
+    with_source = sum(1 for s in accepted if s.get("source"))
+    print(f"  Submissions with source code from API: {with_source}/{len(accepted)}")
 
     return accepted
 
@@ -585,23 +590,19 @@ def main():
     print()
 
     # 1. Connect to GitHub
-    print("[1/7] Connecting to GitHub...")
+    print("[1/6] Connecting to GitHub...")
     gh = Github(auth=Auth.Token(GITHUB_TOKEN))
     repo = gh.get_repo(GITHUB_REPO)
     default_branch = repo.default_branch
     print(f"  Connected. Default branch: {default_branch}")
 
-    # 2. Log in to Codeforces (needed to scrape submission source code)
-    print("[2/7] Creating Codeforces session...")
-    cf_session = create_cf_session()
-
-    # 3. Load already-pushed state
-    print("[3/7] Loading pushed state...")
+    # 2. Load already-pushed state
+    print("[2/6] Loading pushed state...")
     pushed_ids = load_pushed_state(repo)
     print(f"  Already pushed: {len(pushed_ids)} submissions")
 
-    # 4. Fetch accepted submissions from Codeforces
-    print("[4/7] Fetching accepted submissions from Codeforces...")
+    # 3. Fetch accepted submissions from Codeforces (with source code via API)
+    print("[3/6] Fetching accepted submissions from Codeforces...")
     accepted = fetch_accepted_submissions()
 
     if not accepted:
@@ -621,47 +622,65 @@ def main():
         print("  Everything is up to date. Nothing to push.")
         return
 
-    # 5. Fetch contest names for better folder naming
-    print("[5/7] Fetching contest names...")
+    # 4. Fetch contest names for better folder naming
+    print("[4/6] Fetching contest names...")
     contest_names = fetch_contest_names()
 
-    # 6. Fetch source code and build file map
-    print(f"[6/7] Fetching source code for {len(new_submissions)} submissions...")
+    # 5. Build file map — use source from API, fall back to scraping
+    print(f"[5/6] Building file map for {len(new_submissions)} submissions...")
     file_map = {}  # path -> content
     newly_pushed = set()
-    skipped = 0
+    missing_source = []  # submissions without source from API
 
-    for i, sub in enumerate(new_submissions, 1):
-        sub_id = sub["id"]
-        contest_id = sub.get("contestId") or sub.get("problem", {}).get("contestId")
-        problem = sub.get("problem", {})
-        index = problem.get("index", "?")
-        name = problem.get("name", "?")
+    for sub in new_submissions:
+        source = sub.get("source")
+        if source:
+            path = build_file_path(sub, contest_names)
+            file_map[path] = source
+            newly_pushed.add(sub["id"])
+        else:
+            missing_source.append(sub)
 
-        print(f"  [{i}/{len(new_submissions)}] {index}. {name} (submission {sub_id})...")
-        source = fetch_submission_source(cf_session, contest_id, sub_id)
+    print(f"  From API: {len(file_map)} submissions with source code")
 
-        if source is None:
-            print(f"    Skipped (could not fetch source code)")
-            skipped += 1
-            continue
+    # Fallback: scrape source code for submissions not returned by API
+    if missing_source:
+        print(f"  Scraping {len(missing_source)} submissions without API source...")
+        cf_session = create_cf_session()
+        skipped = 0
 
-        path = build_file_path(sub, contest_names)
-        file_map[path] = source
-        newly_pushed.add(sub_id)
+        for i, sub in enumerate(missing_source, 1):
+            sub_id = sub["id"]
+            contest_id = sub.get("contestId") or sub.get("problem", {}).get("contestId")
+            problem = sub.get("problem", {})
+            index = problem.get("index", "?")
+            name = problem.get("name", "?")
 
-        if i < len(new_submissions):
-            time.sleep(2)  # respect CF rate limit
+            print(f"    [{i}/{len(missing_source)}] {index}. {name} (submission {sub_id})...")
+            source = fetch_submission_source(cf_session, contest_id, sub_id)
 
-    print(f"  Fetched: {len(file_map)}, Skipped: {skipped}")
+            if source is None:
+                print(f"      Skipped (could not fetch source code)")
+                skipped += 1
+                continue
+
+            path = build_file_path(sub, contest_names)
+            file_map[path] = source
+            newly_pushed.add(sub_id)
+
+            if i < len(missing_source):
+                time.sleep(2)  # respect CF rate limit
+
+        print(f"  Scraped: {len(file_map) - (len(new_submissions) - len(missing_source))}, Skipped: {skipped}")
 
     if not file_map:
-        print("  ERROR: No source code could be fetched for any submission.")
-        print("  Check that CF_PASSWORD is correct and you can log in at codeforces.com/enter")
+        print("  ERROR: No source code could be fetched.")
+        print("  Make sure the API key belongs to the same account as CF_HANDLE.")
+        print("  (includeSources only works for your own account)")
         sys.exit(1)
 
-    # 7. Push to GitHub in batches
-    print(f"[7/7] Pushing {len(file_map)} files to GitHub...")
+    # 6. Push to GitHub in batches
+    print(f"[6/6] Pushing {len(file_map)} files to GitHub...")
     all_paths = list(file_map.keys())
 
     for batch_start in range(0, len(all_paths), BATCH_SIZE):
