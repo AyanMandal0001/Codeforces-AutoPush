@@ -223,6 +223,65 @@ def fetch_contest_names() -> Dict[int, str]:
 # ── Codeforces session (for scraping submission source code) ──────────────────
 
 
+def _solve_rcpc_challenge(session: requests.Session, resp: requests.Response) -> bool:
+    """
+    Solve CF's RCPC anti-bot challenge.
+
+    CF serves a page with JavaScript that computes a cookie value
+    (via AES-CBC decryption or BigInt multiplication) and sets it
+    before allowing access. We replicate that computation in Python.
+    Returns True if a challenge was found and solved.
+    """
+    text = resp.text
+
+    # Pattern 1 (current): AES-CBC decryption
+    # a=toNumbers("...");b=toNumbers("...");c=toNumbers("...");
+    a_match = re.search(r'a=toNumbers\("([0-9a-fA-F]+)"\)', text)
+    b_match = re.search(r'b=toNumbers\("([0-9a-fA-F]+)"\)', text)
+    c_match = re.search(r'c=toNumbers\("([0-9a-fA-F]+)"\)', text)
+
+    if a_match and b_match and c_match:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+        key = bytes.fromhex(a_match.group(1))
+        iv = bytes.fromhex(b_match.group(1))
+        ciphertext = bytes.fromhex(c_match.group(1))
+
+        cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
+        decryptor = cipher.decryptor()
+        plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+
+        session.cookies.set("RCPC", plaintext.hex())
+        print("  Solved RCPC anti-bot challenge (AES)")
+        return True
+
+    # Pattern 2 (older): BigInt multiplication
+    big_match = re.search(
+        r'var\s+a\s*=\s*BigInt\(["\']0x([0-9a-fA-F]+)["\']\).*?'
+        r'var\s+b\s*=\s*BigInt\(["\']0x([0-9a-fA-F]+)["\']\)',
+        text, re.DOTALL,
+    )
+    if big_match:
+        a_val = int(big_match.group(1), 16)
+        b_val = int(big_match.group(2), 16)
+        session.cookies.set("RCPC", hex(a_val * b_val)[2:])
+        print("  Solved RCPC anti-bot challenge (BigInt)")
+        return True
+
+    return False
+
+
+def _cf_get(session: requests.Session, url: str) -> requests.Response:
+    """
+    GET a Codeforces URL, automatically solving the RCPC challenge if needed.
+    """
+    resp = session.get(url, timeout=30)
+    if resp.status_code == 403 and _solve_rcpc_challenge(session, resp):
+        resp = session.get(url, timeout=30)
+    resp.raise_for_status()
+    return resp
+
+
 def _compute_tta(csrf_token: str) -> int:
     """Compute the _tta value from a CSRF token (CF's anti-bot measure)."""
     tta = 0
@@ -251,9 +310,8 @@ def create_cf_session() -> requests.Session:
 
     print("  Logging in to Codeforces...")
 
-    # Step 1: GET the login page to obtain CSRF token and cookies
-    resp = session.get("https://codeforces.com/enter", timeout=30)
-    resp.raise_for_status()
+    # Step 1: GET the login page (may trigger RCPC anti-bot challenge)
+    resp = _cf_get(session, "https://codeforces.com/enter")
 
     # Step 2: Extract CSRF token from the HTML
     csrf_match = re.search(
@@ -316,6 +374,9 @@ def fetch_submission_source(
     for url in urls_to_try:
         try:
             resp = session.get(url, timeout=30)
+            # Handle RCPC on submission pages too
+            if resp.status_code == 403 and _solve_rcpc_challenge(session, resp):
+                resp = session.get(url, timeout=30)
             if resp.status_code == 404:
                 continue  # try next URL variant
             resp.raise_for_status()
