@@ -250,37 +250,42 @@ void print(ll aa[], ll n) {
 ll n, k;
 ll a, b, c;
 string s;
-ll aa[1000100];
-
+ll rec(ll level,ll A,ll B,vector<vector<ll>>&v,map<vector<ll>,ll>&dp){
+    //basecase
+    if(level==n){
+     //   cout<<A<<" "<<B<<endl;
+         return lcm(A,B);
+    }
+    //cache
+  if(dp.find({level,A,B})!=dp.end()) return dp[{level,A,B}];
+    //transiton
+    ll ans=-1;
+    // take in bag A
+    //nottake
+   ans=max(ans,rec(level+1,gcd(A,v[level][0]),gcd(B,v[level][1]),v,dp));
+   ans=max(ans,rec(level+1,gcd(A,v[level][1]),gcd(B,v[level][0]),v,dp));
+    // save and return
+    return dp[{level,A,B}]=ans;
+   // return ans;
+}
 void solve() {
-  cin >>n>>s;
-  ll tot=n*(n+1)/2;
-  // have to find l..r such than cnt0==cnt1
-  vector<ll>p(n);
-  for(ll i=0;i<n;i++){
-    if(s[i]=='1') p[i]=1;
-    else p[i]=-1;
-  }
-  for(ll i=1;i<n;i++)  p[i] += p[i-1];
-  // pr(p);
-  map<ll,ll>mp;
-  mp[0]++;
-  for(ll i=0;i<n;i++){
-    mp[p[i]]++;
-  }
-  for(auto it=mp.begin();it!=mp.end();it++){
-    ll f=mp[it->first];
-     tot+= (f-1)*f/2;
-  }
-  cout<<tot<<endl;
+ cin >>n;
+map<vector<ll>,ll>dp;
+ vector<vector<ll>>v;
+ for(ll i=0;i<n;i++){
+    ll ai,bi; cin >>ai>>bi;
+   v.pb({ai,bi});
+ }
+ cout<<rec(0,0,0,v,dp)<<endl;
 }
 
 /* ===================== MAIN ===================== */
 
 signed main() {
     faster();
+   // cout<<power(2,50)<<endl;
     ll tt = 1;
-    cin >> tt;
+   // cin >> tt;
     while (tt--) solve();
     return 0;
 }
